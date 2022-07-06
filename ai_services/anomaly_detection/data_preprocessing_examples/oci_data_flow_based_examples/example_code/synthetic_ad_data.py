@@ -1,64 +1,81 @@
 import json
 import math
+import time
 
-from datetime import datetime
+import datetime
 from pyspark.sql import SparkSession
 import argparse
-from pyspark.sql import functions as F
-from pyspark.mllib.random import RandomRDDs
 import numpy as np
 import pandas as pd
-import string
 import random
-from pyspark.sql.types import StringType
+
+DEFAULT_CATEGORIES = 0
+DEFAULT_COLUMN_PREFIX = 'meter-'
+DEFAULT_SHUFFLE = False
+DEFAULT_FREQUENCY = "1min"
+DEFAULT_OFFSET = 0
+DEFAULT_DIMENSIONS = 2
+DEFAULT_IS_UNIX_TIMESTAMP = True
 
 
-def create_spark_session():
-    spark_session = SparkSession.builder.appName(
-        "PySpark_synthetic_data_generator"
-    ).getOrCreate()
-    return spark_session
+def get_spark_context():
+    return SparkSession.builder.appName("PySpark_synthetic_data_generator").getOrCreate()
 
 
-def gen_synthetic_pivot(spark, args):
+def get_vectorized_definition(metadata, default_value):
+    if isinstance(metadata, int):
+        return [default_value for _ in range(metadata)]
+    return metadata
+
+
+def formatted_timestamp(timestamp, is_unix_timestamp):
+    if is_unix_timestamp:
+        return str(time.mktime(timestamp.timetuple()))
+    return ''.join([timestamp.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3], timestamp.strftime("%z")])
+
+
+def generate_pivoted(destination, values, observations, dimensions=DEFAULT_DIMENSIONS, frequency=DEFAULT_FREQUENCY,
+                     column_prefix=DEFAULT_COLUMN_PREFIX, offset=DEFAULT_OFFSET,
+                     is_unix_timestamp=DEFAULT_IS_UNIX_TIMESTAMP, **kwargs):
     """
     Generate a dataset with three columns as timestamp, signal ID and signal value
     and num_signals x num_observations rows,
     the number of observations per signals are identical
-    Args:
-        spark: Spark session
-        args: contains
-            args.output: destination directory to store generated sample_datasets as a CSV file
-            args.num_signals: number of signals
-            args.num_observations: number of observations
-            args.freq: sampling interval for time series
-        max_cat: maximum number of categories in each signal/ column
-    """
-    destination = '/'.join([args.output, 'pivot', str(datetime.now())])
 
-    timestamps = pd.date_range(
-        start="1/1/2018", periods=args.observations, freq=args.frequency
-    )
-    rdd = spark.sparkContext.parallelize(range(int(args.values))).flatMap(
+    :param destination: Output location
+    :param values: list containing range of values in each column that has uniform distribution
+    :param observations: number of observations
+    :param dimensions: number of dimensions that can be used for pivoting
+    :param frequency: sampling interval for time series (default = 1 min)
+    :param column_prefix: prefix of the column name (default = "meter-")
+    :param offset: offset in the feature index (default = 0)
+    :param is_unix_timestamp: is unix timestamp (default = True)
+    """
+    destination = '/'.join([destination, 'pivot'])
+
+    timestamps = pd.date_range(start="1/1/2018", periods=observations, freq=frequency)
+    values = get_vectorized_definition(values, 1)
+
+    sc = get_spark_context()
+    rdd = sc.sparkContext.parallelize(range(len(values))).flatMap(
         lambda x: [
             (
-                str(dt),
-                f"meter-{x}",
+                formatted_timestamp(dt, is_unix_timestamp),
+                f"{column_prefix}{offset + x}",
                 np.random.rand(),
             )
-            + tuple(map(str, np.random.randint(3, size=args.max_pivot - 1)))
+            + tuple(map(str, np.random.randint(3, size=dimensions - 1)))
             for dt in timestamps
         ]
     )
-    df = rdd.toDF(
-        ["timestamp", "meter-ID", "value"]
-        + [f"dim{i + 1}" for i in range(args.max_pivot - 1)]
-    )
+    df = rdd.toDF(["timestamp", f"{column_prefix}ID", "value"] + [f"dim{i + 1}" for i in range(dimensions - 1)])
     # df = df.orderBy(F.rand())
     df.coalesce(1).write.csv(destination, header=True)
 
 
-def generate(destination, values, categories, observations, shuffle=False, frequency='1min', offset=0):
+def generate(destination, values, categories, observations, shuffle=DEFAULT_SHUFFLE, frequency=DEFAULT_FREQUENCY,
+             column_prefix=DEFAULT_COLUMN_PREFIX, offset=DEFAULT_OFFSET, is_unix_timestamp=DEFAULT_IS_UNIX_TIMESTAMP,
+             **kwargs):
     """
     Generate an anomaly detection dataset.
 
@@ -68,9 +85,11 @@ def generate(destination, values, categories, observations, shuffle=False, frequ
     :param observations: number of observations
     :param shuffle: shuffle column order (default = False)
     :param frequency: sampling interval for time series (default = 1 min)
+    :param column_prefix: prefix of the column name (default = "meter-")
     :param offset: offset in the feature index (default = 0)
+    :param is_unix_timestamp: is unix timestamp (default = True)
     """
-    destination = '/'.join([destination, 'synthetic', str(datetime.now())])
+    destination = '/'.join([destination, 'synthetic'])
 
     def get_uniform_float(a, b):
         return np.random.uniform(a, b)
@@ -113,20 +132,16 @@ def generate(destination, values, categories, observations, shuffle=False, frequ
 
         raise AssertionError("Category is not given in proper format")
 
-    spark_session = create_spark_session()
-    timestamps = pd.date_range(
-        start="1/1/2018", periods=observations, freq=frequency
-    )
-    if isinstance(values, int):
-        values = [1 for _ in range(values)]
-    if isinstance(categories, int):
-        categories = [2 for _ in range(categories)]
-    columns = ["timestamp"] + [f"feat-{i + offset}" for i in range(len(values))] + [
-        f"feat-{i + len(values) + offset}" for i in range(len(categories))]
+    values = get_vectorized_definition(values, 1)
+    categories = get_vectorized_definition(categories, 2)
+
+    sc = get_spark_context()
+    timestamps = pd.date_range(start="1/1/2018", periods=observations, freq=frequency)
+    columns = ["timestamp"] + [f"{column_prefix}{i + offset}" for i in range(len(values) + len(categories))]
 
     df = (
-        spark_session.sparkContext.parallelize(range(observations))
-        .map(lambda x: tuple([str(timestamps[x])]) + tuple(
+        sc.sparkContext.parallelize(range(observations))
+        .map(lambda x: tuple([formatted_timestamp(timestamps[x], is_unix_timestamp)]) + tuple(
             [get_continuous_value(continuous_metadata) for continuous_metadata in values]) + tuple(
             [get_categorical_value(category_metadata) for category_metadata in categories]))
         .toDF(columns)
@@ -140,22 +155,37 @@ def generate(destination, values, categories, observations, shuffle=False, frequ
     df.select(*columns).coalesce(1).write.csv(destination, header=True)
 
 
-if __name__ == "__main__":
-    DEFAULT_CATEGORIES = 0
-    DEFAULT_SHUFFLE = False
-    DEFAULT_FREQUENCY = "1min"
-    DEFAULT_OFFSET = 0
+def boolean(value):
+    if value.lower() in ["false", "no", "n", "0", "f"]:
+        return False
+    return True
 
+
+if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", required=False, type=str, default=None)
     parser.add_argument("--output", required=True)
     parser.add_argument("--values", required=True, type=str)
     parser.add_argument("--categories", required=False, type=str, default=DEFAULT_CATEGORIES)
     parser.add_argument("--observations", required=True, type=int)
-    parser.add_argument("--shuffle", required=False, type=bool, default=DEFAULT_SHUFFLE)
+    parser.add_argument("--shuffle", required=False, type=boolean, default=str(DEFAULT_SHUFFLE))
     parser.add_argument("--frequency", required=False, default=DEFAULT_FREQUENCY)
+    parser.add_argument("--column_prefix", required=False, default=DEFAULT_COLUMN_PREFIX)
     parser.add_argument("--offset", required=False, type=int, default=DEFAULT_OFFSET)
-    parser.add_argument("--max_pivot", required=False, type=int, default=DEFAULT_OFFSET)
+    parser.add_argument("--dimensions", required=False, type=int, default=DEFAULT_DIMENSIONS)
+    parser.add_argument("--is_unix_timestamp", required=False, type=boolean, default=str(DEFAULT_IS_UNIX_TIMESTAMP))
     args = parser.parse_args()
-    # gen_synthetic_pivot(create_spark_session(), args)
-    generate(args.output, json.loads(str(args.values)), json.loads(str(args.categories)), args.observations,
-             args.shuffle, args.frequency, int(args.offset))
+
+    _destination = '/'.join([args.output, str(datetime.datetime.now())])
+    _column_prefix = args.column_prefix
+    if not _column_prefix.endswith('-'):
+        _column_prefix.append('-')
+
+    if args.mode == 'pivot':
+        action = generate_pivoted
+    else:
+        action = generate
+
+    action(destination=_destination, values=json.loads(str(args.values)), categories=json.loads(str(args.categories)),
+           observations=args.observations, dimensions=args.dimensions, shuffle=args.shuffle, frequency=args.frequency,
+           column_prefix=_column_prefix, offset=int(args.offset), is_unix_timestamp=args.is_unix_timestamp)
