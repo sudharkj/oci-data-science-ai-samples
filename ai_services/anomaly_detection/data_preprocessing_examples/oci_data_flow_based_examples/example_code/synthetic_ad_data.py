@@ -9,6 +9,8 @@ import numpy as np
 import pandas as pd
 import random
 
+from pyspark.sql.utils import AnalysisException
+
 DEFAULT_CATEGORIES = 0
 DEFAULT_COLUMN_PREFIX = 'meter-'
 DEFAULT_SHUFFLE = False
@@ -16,6 +18,8 @@ DEFAULT_FREQUENCY = "1min"
 DEFAULT_OFFSET = 0
 DEFAULT_DIMENSIONS = 2
 DEFAULT_TIMESTAMP_FORMAT = None
+DEFAULT_IGNORE_NAN = False
+DEFAULT_ADDITIONAL_COLUMNS = 0
 
 
 def get_spark_context():
@@ -36,7 +40,7 @@ def formatted_timestamp(timestamp, timestamp_format):
 
 def generate_pivoted(destination, values, observations, dimensions=DEFAULT_DIMENSIONS, frequency=DEFAULT_FREQUENCY,
                      column_prefix=DEFAULT_COLUMN_PREFIX, offset=DEFAULT_OFFSET,
-                     timestamp_format=DEFAULT_TIMESTAMP_FORMAT, **kwargs):
+                     timestamp_format=DEFAULT_TIMESTAMP_FORMAT, ignore_nan=DEFAULT_IGNORE_NAN, **kwargs):
     """
     Generate a dataset with three columns as timestamp, signal ID and signal value
     and num_signals x num_observations rows,
@@ -50,9 +54,8 @@ def generate_pivoted(destination, values, observations, dimensions=DEFAULT_DIMEN
     :param column_prefix: prefix of the column name (default = "meter-")
     :param offset: offset in the feature index (default = 0)
     :param timestamp_format: timestamp_format (default = None, that returns unix timestamp)
+    :param ignore_nan: ignore nan probs in columns (default = False)
     """
-    destination = '/'.join([destination, 'pivot'])
-
     timestamps = pd.date_range(start="1/1/2018", periods=observations, freq=frequency)
     values = get_vectorized_definition(values, 1)
 
@@ -60,28 +63,32 @@ def generate_pivoted(destination, values, observations, dimensions=DEFAULT_DIMEN
     rdd = sc.sparkContext.parallelize(range(len(values))).flatMap(
         lambda x: [
             (
-                formatted_timestamp(dt, timestamp_format),
+                formatted_timestamp(timestamp, timestamp_format),
                 f"{column_prefix}{offset + x}",
-                get_continuous_value(values[x]),
+                float(get_continuous_value(values[x], ignore_nan)),
             )
             + tuple(map(str, np.random.randint(3, size=dimensions - 1)))
-            for dt in timestamps
+            for timestamp in timestamps
         ]
     )
-    df = rdd.toDF(["timestamp", f"{column_prefix}ID", "value"] + [f"dim{i + 1}" for i in range(dimensions - 1)])
-    # df = df.orderBy(F.rand())
-    df.coalesce(1).write.csv(destination, header=True)
+    df = rdd.toDF(
+        ["timestamp", f"{column_prefix}ID", "value"] + [f"dim{i + 1}" for i in range(dimensions - 1)]).coalesce(1)
+    try:
+        df.write.csv(destination, header=True)
+    except AnalysisException:
+        destination = '/'.join([destination, f'pivot-{str(datetime.datetime.now())}'])
+        df.write.csv(destination, header=True)
 
 
 def get_uniform_float(a, b):
     return np.random.uniform(a, b)
 
 
-def get_continuous_value(metadata):
+def get_continuous_value(metadata, ignore_nan=DEFAULT_IGNORE_NAN):
     if isinstance(metadata, int):
         return get_uniform_float(0.0, metadata)
 
-    if 'nan_prob' in metadata:
+    if not ignore_nan and 'nan_prob' in metadata:
         is_nan_value = np.random.binomial(1, metadata['nan_prob'])
         if is_nan_value > 0:
             return math.nan
@@ -120,7 +127,7 @@ def get_categorical_value(metadata):
 
 def generate(destination, values, categories, observations, shuffle=DEFAULT_SHUFFLE, frequency=DEFAULT_FREQUENCY,
              column_prefix=DEFAULT_COLUMN_PREFIX, offset=DEFAULT_OFFSET, timestamp_format=DEFAULT_TIMESTAMP_FORMAT,
-             **kwargs):
+             ignore_nan=DEFAULT_IGNORE_NAN, additional_columns=DEFAULT_ADDITIONAL_COLUMNS, **kwargs):
     """
     Generate an anomaly detection dataset.
 
@@ -133,21 +140,24 @@ def generate(destination, values, categories, observations, shuffle=DEFAULT_SHUF
     :param column_prefix: prefix of the column name (default = "meter-")
     :param offset: offset in the feature index (default = 0)
     :param timestamp_format: timestamp_format (default = None, that returns unix timestamp)
+    :param additional_columns: number of additional random uniform columns (default = 0)
+    :param ignore_nan: ignore nan probs in columns (default = False)
     """
-    destination = '/'.join([destination, 'synthetic'])
-
     values = get_vectorized_definition(values, 1)
+    additional_columns = get_vectorized_definition(additional_columns, 1)
     categories = get_vectorized_definition(categories, 2)
 
     sc = get_spark_context()
     timestamps = pd.date_range(start="1/1/2018", periods=observations, freq=frequency)
-    columns = ["timestamp"] + [f"{column_prefix}{i + offset}" for i in range(len(values) + len(categories))]
+    columns = ["timestamp"] + [f"{column_prefix}{i + offset}" for i in range(len(values) + len(categories))] + [
+        f"random-{i + offset}" for i in range(len(additional_columns))]
 
     df = (
         sc.sparkContext.parallelize(range(observations))
         .map(lambda x: tuple([formatted_timestamp(timestamps[x], timestamp_format)]) + tuple(
-            [get_continuous_value(continuous_metadata) for continuous_metadata in values]) + tuple(
-            [get_categorical_value(category_metadata) for category_metadata in categories]))
+            [float(get_continuous_value(continuous_metadata, ignore_nan)) for continuous_metadata in values]) + tuple(
+            [int(get_categorical_value(category_metadata)) for category_metadata in categories]) + tuple(
+            [float(get_continuous_value(continuous_metadata, ignore_nan)) for continuous_metadata in additional_columns]))
         .toDF(columns)
     )
 
@@ -156,7 +166,12 @@ def generate(destination, values, categories, observations, shuffle=DEFAULT_SHUF
         random.shuffle(columns)
         columns = ['timestamp'] + columns
 
-    df.select(*columns).coalesce(1).write.csv(destination, header=True)
+    df = df.select(*columns).coalesce(1)
+    try:
+        df.write.csv(destination, header=True)
+    except AnalysisException:
+        destination = '/'.join([destination, f'unpivot-{str(datetime.datetime.now())}'])
+        df.write.csv(destination, header=True)
 
 
 def boolean(value):
@@ -185,11 +200,12 @@ if __name__ == "__main__":
     parser.add_argument("--dimensions", required=False, type=int, default=DEFAULT_DIMENSIONS)
     # acceptable format: %Y-%m-%dT%H:%M:%S
     parser.add_argument("--timestamp_format", required=False, type=str, default=DEFAULT_TIMESTAMP_FORMAT)
+    parser.add_argument("--ignore_nan", required=False, type=boolean, default=str(DEFAULT_IGNORE_NAN))
+    parser.add_argument("--additional_columns", required=False, type=int, default=DEFAULT_ADDITIONAL_COLUMNS)
     args = parser.parse_args()
 
-    _destination = '/'.join([args.output, str(datetime.datetime.now())])
-
-    args.mode(destination=_destination, values=json.loads(str(args.values)),
+    args.mode(destination=args.output, values=json.loads(str(args.values)),
               categories=json.loads(str(args.categories)), observations=args.observations, dimensions=args.dimensions,
               shuffle=args.shuffle, frequency=args.frequency, column_prefix=args.column_prefix, offset=int(args.offset),
-              timestamp_format=args.timestamp_format)
+              timestamp_format=args.timestamp_format, ignore_nan=args.ignore_nan,
+              additional_columns=args.additional_columns)
