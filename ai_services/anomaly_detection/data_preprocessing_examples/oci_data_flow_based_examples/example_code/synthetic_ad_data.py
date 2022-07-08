@@ -15,7 +15,7 @@ DEFAULT_SHUFFLE = False
 DEFAULT_FREQUENCY = "1min"
 DEFAULT_OFFSET = 0
 DEFAULT_DIMENSIONS = 2
-DEFAULT_IS_UNIX_TIMESTAMP = True
+DEFAULT_TIMESTAMP_FORMAT = None
 
 
 def get_spark_context():
@@ -28,15 +28,15 @@ def get_vectorized_definition(metadata, default_value):
     return metadata
 
 
-def formatted_timestamp(timestamp, is_unix_timestamp):
-    if is_unix_timestamp:
+def formatted_timestamp(timestamp, timestamp_format):
+    if timestamp_format is None or len(timestamp_format) == 0:
         return str(time.mktime(timestamp.timetuple()))
-    return ''.join([timestamp.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3], timestamp.strftime("%z")])
+    return timestamp.strftime(timestamp_format)
 
 
 def generate_pivoted(destination, values, observations, dimensions=DEFAULT_DIMENSIONS, frequency=DEFAULT_FREQUENCY,
                      column_prefix=DEFAULT_COLUMN_PREFIX, offset=DEFAULT_OFFSET,
-                     is_unix_timestamp=DEFAULT_IS_UNIX_TIMESTAMP, **kwargs):
+                     timestamp_format=DEFAULT_TIMESTAMP_FORMAT, **kwargs):
     """
     Generate a dataset with three columns as timestamp, signal ID and signal value
     and num_signals x num_observations rows,
@@ -49,7 +49,7 @@ def generate_pivoted(destination, values, observations, dimensions=DEFAULT_DIMEN
     :param frequency: sampling interval for time series (default = 1 min)
     :param column_prefix: prefix of the column name (default = "meter-")
     :param offset: offset in the feature index (default = 0)
-    :param is_unix_timestamp: is unix timestamp (default = True)
+    :param timestamp_format: timestamp_format (default = None, that returns unix timestamp)
     """
     destination = '/'.join([destination, 'pivot'])
 
@@ -60,9 +60,9 @@ def generate_pivoted(destination, values, observations, dimensions=DEFAULT_DIMEN
     rdd = sc.sparkContext.parallelize(range(len(values))).flatMap(
         lambda x: [
             (
-                formatted_timestamp(dt, is_unix_timestamp),
+                formatted_timestamp(dt, timestamp_format),
                 f"{column_prefix}{offset + x}",
-                np.random.rand(),
+                get_continuous_value(values[x]),
             )
             + tuple(map(str, np.random.randint(3, size=dimensions - 1)))
             for dt in timestamps
@@ -73,8 +73,53 @@ def generate_pivoted(destination, values, observations, dimensions=DEFAULT_DIMEN
     df.coalesce(1).write.csv(destination, header=True)
 
 
+def get_uniform_float(a, b):
+    return np.random.uniform(a, b)
+
+
+def get_continuous_value(metadata):
+    if isinstance(metadata, int):
+        return get_uniform_float(0.0, metadata)
+
+    if 'nan_prob' in metadata:
+        is_nan_value = np.random.binomial(1, metadata['nan_prob'])
+        if is_nan_value > 0:
+            return math.nan
+
+    if 'max' in metadata:
+        if metadata['max'] == 1:
+            return get_uniform_float(0, metadata['max'])
+        return get_uniform_int(1, metadata['max'])
+
+    if 'range' in metadata:
+        a, b = metadata['range']
+        if abs(a - b) == 1:
+            return get_uniform_float(a, b)
+        return get_uniform_int(a, b)
+
+    raise AssertionError(f"Continuous is not given in proper format{json.dumps(metadata)}")
+
+
+def get_uniform_int(a, b):
+    return np.random.randint(a, b + 1)
+
+
+def get_categorical_value(metadata):
+    if isinstance(metadata, int) and metadata > 1:
+        return get_uniform_int(1, metadata)
+
+    if 'range' in metadata and len(metadata['range']) == 2:
+        return get_uniform_int(*metadata['range'])
+
+    if 'values' in metadata and len(metadata['values']) >= 2:
+        ind = get_uniform_int(0, len(metadata['values']) - 1)
+        return metadata['values'][ind]
+
+    raise AssertionError("Category is not given in proper format")
+
+
 def generate(destination, values, categories, observations, shuffle=DEFAULT_SHUFFLE, frequency=DEFAULT_FREQUENCY,
-             column_prefix=DEFAULT_COLUMN_PREFIX, offset=DEFAULT_OFFSET, is_unix_timestamp=DEFAULT_IS_UNIX_TIMESTAMP,
+             column_prefix=DEFAULT_COLUMN_PREFIX, offset=DEFAULT_OFFSET, timestamp_format=DEFAULT_TIMESTAMP_FORMAT,
              **kwargs):
     """
     Generate an anomaly detection dataset.
@@ -87,50 +132,9 @@ def generate(destination, values, categories, observations, shuffle=DEFAULT_SHUF
     :param frequency: sampling interval for time series (default = 1 min)
     :param column_prefix: prefix of the column name (default = "meter-")
     :param offset: offset in the feature index (default = 0)
-    :param is_unix_timestamp: is unix timestamp (default = True)
+    :param timestamp_format: timestamp_format (default = None, that returns unix timestamp)
     """
     destination = '/'.join([destination, 'synthetic'])
-
-    def get_uniform_float(a, b):
-        return np.random.uniform(a, b)
-
-    def get_continuous_value(metadata):
-        if isinstance(metadata, int):
-            return get_uniform_float(0.0, metadata)
-
-        if 'nan_prob' in metadata:
-            is_nan_value = np.random.binomial(1, metadata['nan_prob'])
-            if is_nan_value > 0:
-                return math.nan
-
-        if 'max' in metadata:
-            if metadata['max'] == 1:
-                return get_uniform_float(0, metadata['max'])
-            return get_uniform_int(1, metadata['max'])
-
-        if 'range' in metadata:
-            a, b = metadata['range']
-            if abs(a - b) == 1:
-                return get_uniform_float(a, b)
-            return get_uniform_int(a, b)
-
-        raise AssertionError(f"Continuous is not given in proper format{json.dumps(metadata)}")
-
-    def get_uniform_int(a, b):
-        return np.random.randint(a, b + 1)
-
-    def get_categorical_value(metadata):
-        if isinstance(metadata, int) and metadata > 1:
-            return get_uniform_int(1, metadata)
-
-        if 'range' in metadata and len(metadata['range']) == 2:
-            return get_uniform_int(*metadata['range'])
-
-        if 'values' in metadata and len(metadata['values']) >= 2:
-            ind = get_uniform_int(0, len(metadata['values']) - 1)
-            return metadata['values'][ind]
-
-        raise AssertionError("Category is not given in proper format")
 
     values = get_vectorized_definition(values, 1)
     categories = get_vectorized_definition(categories, 2)
@@ -141,7 +145,7 @@ def generate(destination, values, categories, observations, shuffle=DEFAULT_SHUF
 
     df = (
         sc.sparkContext.parallelize(range(observations))
-        .map(lambda x: tuple([formatted_timestamp(timestamps[x], is_unix_timestamp)]) + tuple(
+        .map(lambda x: tuple([formatted_timestamp(timestamps[x], timestamp_format)]) + tuple(
             [get_continuous_value(continuous_metadata) for continuous_metadata in values]) + tuple(
             [get_categorical_value(category_metadata) for category_metadata in categories]))
         .toDF(columns)
@@ -161,9 +165,15 @@ def boolean(value):
     return True
 
 
+def mode(value):
+    if value.lower() in ['p', 'pivot', 'pivoted', 'generate_pivot', 'generated_pivoted']:
+        return generate_pivoted
+    return generate
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", required=False, type=str, default=None)
+    parser.add_argument("--mode", required=False, type=mode, default=generate)
     parser.add_argument("--output", required=True)
     parser.add_argument("--values", required=True, type=str)
     parser.add_argument("--categories", required=False, type=str, default=DEFAULT_CATEGORIES)
@@ -173,19 +183,13 @@ if __name__ == "__main__":
     parser.add_argument("--column_prefix", required=False, default=DEFAULT_COLUMN_PREFIX)
     parser.add_argument("--offset", required=False, type=int, default=DEFAULT_OFFSET)
     parser.add_argument("--dimensions", required=False, type=int, default=DEFAULT_DIMENSIONS)
-    parser.add_argument("--is_unix_timestamp", required=False, type=boolean, default=str(DEFAULT_IS_UNIX_TIMESTAMP))
+    # acceptable format: %Y-%m-%dT%H:%M:%S
+    parser.add_argument("--timestamp_format", required=False, type=str, default=DEFAULT_TIMESTAMP_FORMAT)
     args = parser.parse_args()
 
     _destination = '/'.join([args.output, str(datetime.datetime.now())])
-    _column_prefix = args.column_prefix
-    if not _column_prefix.endswith('-'):
-        _column_prefix.append('-')
 
-    if args.mode == 'pivot':
-        action = generate_pivoted
-    else:
-        action = generate
-
-    action(destination=_destination, values=json.loads(str(args.values)), categories=json.loads(str(args.categories)),
-           observations=args.observations, dimensions=args.dimensions, shuffle=args.shuffle, frequency=args.frequency,
-           column_prefix=_column_prefix, offset=int(args.offset), is_unix_timestamp=args.is_unix_timestamp)
+    args.mode(destination=_destination, values=json.loads(str(args.values)),
+              categories=json.loads(str(args.categories)), observations=args.observations, dimensions=args.dimensions,
+              shuffle=args.shuffle, frequency=args.frequency, column_prefix=args.column_prefix, offset=int(args.offset),
+              timestamp_format=args.timestamp_format)
