@@ -1,15 +1,13 @@
 import json
 import math
 import time
+import traceback
 
-import datetime
 from pyspark.sql import SparkSession
 import argparse
 import numpy as np
 import pandas as pd
 import random
-
-from pyspark.sql.utils import AnalysisException
 
 DEFAULT_CATEGORIES = 0
 DEFAULT_COLUMN_PREFIX = 'meter-'
@@ -38,7 +36,7 @@ def formatted_timestamp(timestamp, timestamp_format):
     return timestamp.strftime(timestamp_format)
 
 
-def generate_pivoted(destination, values, observations, dimensions=DEFAULT_DIMENSIONS, frequency=DEFAULT_FREQUENCY,
+def generate_pivoted(output, values, observations, dimensions=DEFAULT_DIMENSIONS, frequency=DEFAULT_FREQUENCY,
                      column_prefix=DEFAULT_COLUMN_PREFIX, offset=DEFAULT_OFFSET,
                      timestamp_format=DEFAULT_TIMESTAMP_FORMAT, ignore_nan=DEFAULT_IGNORE_NAN, **kwargs):
     """
@@ -46,7 +44,7 @@ def generate_pivoted(destination, values, observations, dimensions=DEFAULT_DIMEN
     and num_signals x num_observations rows,
     the number of observations per signals are identical
 
-    :param destination: Output location
+    :param output: Output location
     :param values: list containing range of values in each column that has uniform distribution
     :param observations: number of observations
     :param dimensions: number of dimensions that can be used for pivoting
@@ -73,11 +71,7 @@ def generate_pivoted(destination, values, observations, dimensions=DEFAULT_DIMEN
     )
     df = rdd.toDF(
         ["timestamp", f"{column_prefix}ID", "value"] + [f"dim{i + 1}" for i in range(dimensions - 1)]).coalesce(1)
-    try:
-        df.write.csv(destination, header=True)
-    except AnalysisException:
-        destination = '/'.join([destination, f'pivot-{str(datetime.datetime.now())}'])
-        df.write.csv(destination, header=True)
+    save_df(df, output)
 
 
 def get_uniform_float(a, b):
@@ -125,13 +119,13 @@ def get_categorical_value(metadata):
     raise AssertionError("Category is not given in proper format")
 
 
-def generate(destination, values, categories, observations, shuffle=DEFAULT_SHUFFLE, frequency=DEFAULT_FREQUENCY,
+def generate(output, values, categories, observations, shuffle=DEFAULT_SHUFFLE, frequency=DEFAULT_FREQUENCY,
              column_prefix=DEFAULT_COLUMN_PREFIX, offset=DEFAULT_OFFSET, timestamp_format=DEFAULT_TIMESTAMP_FORMAT,
              ignore_nan=DEFAULT_IGNORE_NAN, additional_columns=DEFAULT_ADDITIONAL_COLUMNS, **kwargs):
     """
     Generate an anomaly detection dataset.
 
-    :param destination: Output location
+    :param output: Output location
     :param values: list containing range of values in each column that has uniform distribution
     :param categories: list containing maximum number of categories in each categorical column
     :param observations: number of observations
@@ -157,7 +151,8 @@ def generate(destination, values, categories, observations, shuffle=DEFAULT_SHUF
         .map(lambda x: tuple([formatted_timestamp(timestamps[x], timestamp_format)]) + tuple(
             [float(get_continuous_value(continuous_metadata, ignore_nan)) for continuous_metadata in values]) + tuple(
             [int(get_categorical_value(category_metadata)) for category_metadata in categories]) + tuple(
-            [float(get_continuous_value(continuous_metadata, ignore_nan)) for continuous_metadata in additional_columns]))
+            [float(get_continuous_value(continuous_metadata, ignore_nan)) for continuous_metadata in
+             additional_columns]))
         .toDF(columns)
     )
 
@@ -167,11 +162,18 @@ def generate(destination, values, categories, observations, shuffle=DEFAULT_SHUF
         columns = ['timestamp'] + columns
 
     df = df.select(*columns).coalesce(1)
+    save_df(df, output)
+
+
+def save_df(df, output):
     try:
-        df.write.csv(destination, header=True)
-    except AnalysisException:
-        destination = '/'.join([destination, f'unpivot-{str(datetime.datetime.now())}'])
-        df.write.csv(destination, header=True)
+        if output['type'] == 'obj':
+            df.write.csv(output['location'], header=True)
+        else:
+            output.pop('type')
+            df.write.format("oracle").options(**output).save()
+    except:
+        print(traceback.format_exc())
 
 
 def boolean(value):
@@ -189,7 +191,7 @@ def mode(value):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", required=False, type=mode, default=generate)
-    parser.add_argument("--output", required=True)
+    parser.add_argument("--output", required=True, type=str)
     parser.add_argument("--values", required=True, type=str)
     parser.add_argument("--categories", required=False, type=str, default=DEFAULT_CATEGORIES)
     parser.add_argument("--observations", required=True, type=int)
@@ -204,7 +206,7 @@ if __name__ == "__main__":
     parser.add_argument("--additional_columns", required=False, type=int, default=DEFAULT_ADDITIONAL_COLUMNS)
     args = parser.parse_args()
 
-    args.mode(destination=args.output, values=json.loads(str(args.values)),
+    args.mode(output=json.loads(str(args.output)), values=json.loads(str(args.values)),
               categories=json.loads(str(args.categories)), observations=args.observations, dimensions=args.dimensions,
               shuffle=args.shuffle, frequency=args.frequency, column_prefix=args.column_prefix, offset=int(args.offset),
               timestamp_format=args.timestamp_format, ignore_nan=args.ignore_nan,
